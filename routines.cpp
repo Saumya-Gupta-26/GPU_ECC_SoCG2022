@@ -1,3 +1,7 @@
+/*
+SG: This is general C++ code and hence is Host (aka CPU) code. It launches the cuda threads and stuff
+*/
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -72,7 +76,7 @@ std::vector<double> ECC_(
 	(data_3D) ? setBasicParams_const_(section, imageW_, imageH_) : setBasicParams_const_(section, imageW_);
 	// ------- VCEC & bin array -------
 	int binNum_local, binNum_global;
-	std::vector<std::vector<int>> VCEC_local_rec;
+	std::vector<std::vector<int>> VCEC_local_rec;  // SG: in CPU : vector of VCEC ; each VCEC is from one chunk
 	std::vector<std::vector<float>> ascend_unique_arr_local_rec;
 	int** VCEC_host_partial_ = (async_mode) ? allocate_host_memory2D_pinned_<int>(engine_num, pre_binNum) : allocate_host_memory2D_<int>(engine_num, pre_binNum);
 	float** ascend_unique_arr_local_host_ = (async_mode) ? allocate_host_memory2D_pinned_<float>(engine_num, pre_binNum) : allocate_host_memory2D_<float>(engine_num, pre_binNum);
@@ -91,9 +95,12 @@ std::vector<double> ECC_(
 	}
 
 	// ------ Memory transfer and kernel launch
+	// SG: computation over every chunk 
 	for (int i = 0; i < chunk_num; i++) {
 		int engidx = i % engine_num;
 		int chunkH = section[i].second - section[i].first + 1;
+
+		 // SG: Async mode means there is memory transfer of another chunk happening in the background. Else (sync mode) means the entire pipeline is serial instead of parallel
 		if (async_mode) {
 			checkCudaErrors(cudaEventSynchronize(events[engine_num * 2 + engidx]));
 			std::vector<float> ascend_unique_arr_local = (data_3D) ?
@@ -122,6 +129,8 @@ std::vector<double> ECC_(
 			init_VCEC_device(binNum_local, VCEC_device_partial_[engidx], &streams[engidx]);
 			if (data_3D) computeECC_3D(imageH_ - 2, imageW_ - 2, chunkH - 2, binNum_local, texSrc_[engidx], VCEC_device_partial_[engidx], ascend_unique_arr_local_device_[engidx], i == (chunk_num - 1), &streams[engidx]);
 			else computeECC(chunkH - 2, imageW_ - 2, binNum_local, texSrc_[engidx], VCEC_device_partial_[engidx], ascend_unique_arr_local_device_[engidx], i == (chunk_num - 1), &streams[engidx]);
+			
+			// SG: copy global VCEC of this chunk from GPU to CPU 
 			checkCudaErrors(cudaMemcpyAsync(VCEC_host_partial_[engidx], VCEC_device_partial_[engidx], binNum_local * sizeof(int), cudaMemcpyDeviceToHost, streams[engidx]));
 			checkCudaErrors(cudaEventRecord(events[engidx], streams[engidx]));
 		}
@@ -157,6 +166,8 @@ std::vector<double> ECC_(
 		VCEC_local_.assign(VCEC_host_partial_[i % engine_num], VCEC_host_partial_[i % engine_num] + ascend_unique_arr_local_rec[i - engine_num].size());
 		VCEC_local_rec.push_back(VCEC_local_);
 	}
+
+	// SG: In CPU, add results across all chunks into a single final VCEC. 
 	for (size_t i = 0; i < VCEC_local_rec.size(); i++)
 		accumulate_VCEC_host_various_binNum_(VCEC_host_, &VCEC_local_rec[i][0], ascend_unique_arr, ascend_unique_arr_local_rec[i]);
 

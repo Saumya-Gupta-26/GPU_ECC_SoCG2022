@@ -153,6 +153,7 @@ __device__ int binary_search(float* d, int size, float v) {
     return (left + right) / 2;
 }
 
+// SG: Readable 2D version of code.
 __global__ void ECC_kernel_v20(
     cudaTextureObject_t texSrc,
     int binNum,
@@ -161,28 +162,45 @@ __global__ void ECC_kernel_v20(
     int chunk_type_id
 )
 {   // V2.0 is much more readable than V3.0, start from here
-    extern __shared__ float hist_local_[];
+    /*
+    SG: binNum is the len/size of the LOCAL VCEC (by local we mean the local VCEC for a block). It is not 255 by default. 
+    Since they handle floating point numbers, the size of the VCEC is the number of unique floating point values.
+    Thus the maximum size of the GLOBAL VCEC is H*W (in the case that all values are unique).
+    The maximum size of the LOCAL VCEC is the number of unique values handled by the block (collection of threads).
+
+    The VCEC has size 2*binNum ; The first binNum values track changes in EC; the remaining binNum contain the float intensity values in ascending order (eg: 1.23, 3.41, 8.91 etc). There is a 1:1 correspondence between hist_local_[i] & hist_local_[i+binNum] : basically hist_local_[i] contains EC changes for the intensity value stored at hist_local_[i+binNum]. They set the intensity value at hist_local_[i+binNum] using the ascend_unique_arr_device_ function.
+
+    Each thread initializes one location in the local VCEC to 0. If there are more binNum than there are threads, then one thread initializes multiple locations to 0 (each location is blockDim.x*blockDim.y apart). The multiple locations are given by the block_pos update line. So basically the currently executing thread sets block_pos locations in the VCEC to 0. 
+
+    blockDim : contains grid size of each block (how many threads in x direction and how many in y direction)
+    threadIdx : contains the x,y location of a thread within a block
+    */
+    extern __shared__ float hist_local_[];  // SG: the VCEC in shared memory (local to a block)
     int block_pos = blockDim.x * threadIdx.y + threadIdx.x;
     while (block_pos < binNum) {
         hist_local_[block_pos] = 0;
         hist_local_[block_pos + binNum] = ascend_unique_arr_device_[block_pos];
         block_pos = block_pos + blockDim.x * blockDim.y;
     }
-    __syncthreads();
+    __syncthreads(); // SG: making sure entire initialization of local VCEC is done (waiting for all threads to finish executing upto this line). Only then does each thread start execution of below code.
 
+    /* 
+    SG: ix and iy are variables declared in this thread-code and so are stored in registers. If register spills/overflows, global (aka slowest) memory will be used and so we should be careful not to declare too man variables.
+    Since there is 1:1 correspondence between thread location and the pixel coordinate it works on, ix & iy are the pixel coordinates.
+    */
     const int ix = IMAD(blockDim.x, blockIdx.x, threadIdx.x) + 1;
     const int iy = IMAD(blockDim.y, blockIdx.y, threadIdx.y) + 1;
     if (ix < imageW_const_ + 1 && iy < imageH_const_[chunk_type_id] + 1) {
 
-        float change = 1;
-        float c = tex2D<float>(texSrc, ix, iy);
-        float t = tex2D<float>(texSrc, ix, iy - 1);
-        float b = tex2D<float>(texSrc, ix, iy + 1);
-        float l = tex2D<float>(texSrc, ix - 1, iy);
-        float r = tex2D<float>(texSrc, ix + 1, iy);
+        float change = 1; // SG: Each pixel introduces the top-dim cell (in 2D it's the square while in 3D it's the cube). So change has +1 by default.
+        float c = tex2D<float>(texSrc, ix, iy); // SG: extracting float pixel/intensity value from texture memory ; stored in register
+        float t = tex2D<float>(texSrc, ix, iy - 1); // SG: extracting top neighbour intensity value from texture memory ; stored in register
+        float b = tex2D<float>(texSrc, ix, iy + 1); // SG: bottom
+        float l = tex2D<float>(texSrc, ix - 1, iy); // SG: left
+        float r = tex2D<float>(texSrc, ix + 1, iy); // SG: right
 
         // Deciding introduced vertices
-        change += (c < l&& c < t&& c < tex2D<float>(texSrc, ix - 1, iy - 1));
+        change += (c < l&& c < t&& c < tex2D<float>(texSrc, ix - 1, iy - 1)); // SG: diagonal neighbours not stored in register, are accessed on-the-fly
         change += (c < t&& c <= r && c < tex2D<float>(texSrc, ix + 1, iy - 1));
         change += (c < l&& c <= b && c <= tex2D<float>(texSrc, ix - 1, iy + 1));
         change += (c <= b && c <= r && c <= tex2D<float>(texSrc, ix + 1, iy + 1));
@@ -193,13 +211,21 @@ __global__ void ECC_kernel_v20(
         change -= (c <= r);
         change -= (c <= b);
 
-        atomicAdd(&hist_local_[binary_search(&hist_local_[binNum], binNum, c)], change);
+        /*
+        SG: To update the EC change value in the local VCEC, we first use the intensity value c and find it in the hist_local_[binNum] onwards array. Find the idx where c is using binary search. Then use this idx in the hist_local_[0] onwards and update the change there.
+
+        atomicAdd used to prevent race conditions
+        */
+        atomicAdd(&hist_local_[binary_search(&hist_local_[binNum], binNum, c)], change); 
     }
-    __syncthreads();
+    __syncthreads(); // SG: make sure all threads update their local VCEC
+
+     // SG: Start writing local VCEC change to global VCEC (VCEC_device) ; using atomicAdd to prevent race conditions
     if (blockDim.x * threadIdx.y + threadIdx.x < binNum)
         atomicAdd(&VCEC_device[blockDim.x * threadIdx.y + threadIdx.x], (int)hist_local_[blockDim.x * threadIdx.y + threadIdx.x]);
 }
 
+// SG: does same work as ECC_kernel_v20 function, but is less readable and more optimized.
 __global__ void ECC_kernel_v30(
     cudaTextureObject_t texSrc,
     int binNum,
@@ -208,21 +234,22 @@ __global__ void ECC_kernel_v30(
     int chunk_type_id
 )
 {
-    extern __shared__ float hist_local_[];
+    extern __shared__ float hist_local_[]; 
+
     int block_pos = blockDim.x * threadIdx.y + threadIdx.x;
     while (block_pos < binNum) {
         hist_local_[block_pos] = 0;
         hist_local_[block_pos + binNum] = ascend_unique_arr_device_[block_pos];
         block_pos = block_pos + blockDim.x * blockDim.y;
     }
-    __syncthreads();
+    __syncthreads(); 
 
     const int ix = IMAD(blockDim.x, blockIdx.x, threadIdx.x) + 1;
     const int iy = IMAD(blockDim.y, blockIdx.y, threadIdx.y) + 1;
     if (ix < imageW_const_ + 1 && iy < imageH_const_[chunk_type_id] + 1) {
 
-        float change = 1;
-        float c = tex2D<float>(texSrc, ix, iy);
+        float change = 1; 
+        float c = tex2D<float>(texSrc, ix, iy); 
         bool c_l_l = (c < tex2D<float>(texSrc, ix - 1, iy));
         bool c_lq_r = (c <= tex2D<float>(texSrc, ix + 1, iy));
         if (c < tex2D<float>(texSrc, ix, iy - 1)) {
@@ -249,6 +276,7 @@ __global__ void ECC_kernel_v30(
     } 
 }
 
+// SG: 3D version of code
 __global__ void ECC_kernel_3D(
     cudaTextureObject_t texSrc,
     int binNum,
