@@ -168,7 +168,7 @@ __global__ void ECC_kernel_v20(
     Thus the maximum size of the GLOBAL VCEC is H*W (in the case that all values are unique).
     The maximum size of the LOCAL VCEC is the number of unique values handled by the block (collection of threads).
 
-    The VCEC has size 2*binNum ; The first binNum values track changes in EC; the remaining binNum contain the float intensity values in ascending order (eg: 1.23, 3.41, 8.91 etc). There is a 1:1 correspondence between hist_local_[i] & hist_local_[i+binNum] : basically hist_local_[i] contains EC changes for the intensity value stored at hist_local_[i+binNum]. They set the intensity value at hist_local_[i+binNum] using the ascend_unique_arr_device_ function.
+    The VCEC has size 2*binNum ; The first binNum values track changes in EC; the remaining binNum contain the float intensity values in ascending order (eg: 1.23, 3.47, 8.96 etc). There is a 1:1 correspondence between hist_local_[i] & hist_local_[i+binNum] : basically hist_local_[i] contains EC changes for the intensity value stored at hist_local_[i+binNum]. They set the intensity value at hist_local_[i+binNum] using the ascend_unique_arr_device_ function.
 
     Each thread initializes one location in the local VCEC to 0. If there are more binNum than there are threads, then one thread initializes multiple locations to 0 (each location is blockDim.x*blockDim.y apart). The multiple locations are given by the block_pos update line. So basically the currently executing thread sets block_pos locations in the VCEC to 0. 
 
@@ -187,11 +187,14 @@ __global__ void ECC_kernel_v20(
     /* 
     SG: ix and iy are variables declared in this thread-code and so are stored in registers. If register spills/overflows, global (aka slowest) memory will be used and so we should be careful not to declare too man variables.
     Since there is 1:1 correspondence between thread location and the pixel coordinate it works on, ix & iy are the pixel coordinates.
+
+    IMAD declared and defined above. It does product followed by addition. 
     */
     const int ix = IMAD(blockDim.x, blockIdx.x, threadIdx.x) + 1;
     const int iy = IMAD(blockDim.y, blockIdx.y, threadIdx.y) + 1;
     if (ix < imageW_const_ + 1 && iy < imageH_const_[chunk_type_id] + 1) {
 
+        // SG: In some cases it is < while others <= (similarly, >, >=). This is carefully written to break ties. The rule is that lexicographically lower position is preferred.
         float change = 1; // SG: Each pixel introduces the top-dim cell (in 2D it's the square while in 3D it's the cube). So change has +1 by default.
         float c = tex2D<float>(texSrc, ix, iy); // SG: extracting float pixel/intensity value from texture memory ; stored in register
         float t = tex2D<float>(texSrc, ix, iy - 1); // SG: extracting top neighbour intensity value from texture memory ; stored in register
@@ -287,26 +290,29 @@ __global__ void ECC_kernel_3D(
 {
     // Declare and initialize local histogram
     extern __shared__ float hist_local_[];
-    int block_pos = blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x;
+    int block_pos = blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x;  // SG: Doubt: should it be blockDim.z instead of blockDim.x ? Otherwise, similar logic to the 2D case. Each thread initializes multiple locations to 0 (each location is blockDim.x*blockDim.y*blockDim.z apart) in the hist_local_
     while (block_pos < binNum) {
         hist_local_[block_pos] = 0;
         hist_local_[block_pos + binNum] = ascend_unique_arr_device_[block_pos];
         block_pos = block_pos + blockDim.x * blockDim.y * blockDim.z;
     }
-    __syncthreads();
+    __syncthreads();  // SG: wait for all threads to finish initialization
 
+    // SG: get coordinate of pixel using blockIdx and threadIdx
     const int ix = IMAD(blockDim.x, blockIdx.x, threadIdx.x) + 1;
     const int iy = IMAD(blockDim.y, blockIdx.y, threadIdx.y) + 1;
     const int iz = IMAD(blockDim.z, blockIdx.z, threadIdx.z) + 1;
     if (ix < imageW_const_ + 1 && iy < imageH_const_[0] + 1 && iz < imageD_const_[chunk_type_id] + 1) {
-        float change = -1;
-        float ccc = tex3D<float>(texSrc, ix, iy, iz);
+        float change = -1; // SG: Each pixel introduces top-dim cell (cube in 3D). So change is -1 by default.
+
+        // SG: In some cases it is < while others <= (similarly, >, >=). This is carefully written to break ties. The rule is that lexicographically lower position is preferred.
+        float ccc = tex3D<float>(texSrc, ix, iy, iz); // SG: center pixel
         // Variables used 9 times
-        float ccf = tex3D<float>(texSrc, ix, iy, iz - 1);
+        float ccf = tex3D<float>(texSrc, ix, iy, iz - 1); // SG: z denotes front/back directions
         float ccb = tex3D<float>(texSrc, ix, iy, iz + 1);
-        float ctc = tex3D<float>(texSrc, ix, iy - 1, iz);
+        float ctc = tex3D<float>(texSrc, ix, iy - 1, iz); // SG: y denotes top/down directions
         float cdc = tex3D<float>(texSrc, ix, iy + 1, iz);
-        float lcc = tex3D<float>(texSrc, ix - 1, iy, iz);
+        float lcc = tex3D<float>(texSrc, ix - 1, iy, iz); // SG: x denotes left/right directions
         float rcc = tex3D<float>(texSrc, ix + 1, iy, iz);
         // Variables used 3 times
         float lcf = tex3D<float>(texSrc, ix - 1, iy, iz - 1);
@@ -322,8 +328,9 @@ __global__ void ECC_kernel_3D(
         float rcb = tex3D<float>(texSrc, ix + 1, iy, iz + 1);
         float cdb = tex3D<float>(texSrc, ix, iy + 1, iz + 1);
 
-        // Below operations have inherent total order enforced
+        // Below operations have inherent total order enforced  // SG: See Figure 4 in paper to visualize
         // Introduced vertices V (8)
+        // SG: Each top-dim cell (cube in 3D) has eight 0-dim cells (vertices). And so, we need to check which of these 8 vertices are introduced by (ix, iy, iz). Furthermore, for each vertex, we need to compare against seven other neighbours which share this vertex with us.
         change += (ccc < tex3D<float>(texSrc, ix - 1, iy - 1, iz - 1) && ccc < ctf&& ccc < lcf&& ccc < ccf&& ccc < ltc&& ccc < ctc&& ccc < lcc);             // top left front vertex
         change += (ccc <= tex3D<float>(texSrc, ix - 1, iy - 1, iz + 1) && ccc <= ctb && ccc <= lcb && ccc <= ccb && ccc < ltc&& ccc < ctc&& ccc < lcc);      // top left back vertex
         change += (ccc <= tex3D<float>(texSrc, ix + 1, iy - 1, iz + 1) && ccc <= rcb && ccc <= ccb && ccc <= ctb && ccc < ctc&& ccc < rtc&& ccc <= rcc);     // top right back vertex
@@ -335,6 +342,7 @@ __global__ void ECC_kernel_3D(
         change += (ccc < tex3D<float>(texSrc, ix + 1, iy + 1, iz - 1) && ccc < cdf&& ccc < ccf&& ccc < rcf&& ccc <= rcc && ccc <= rdc && ccc <= cdc);        // down right front vertex
 
         // Introduced edges E (12)
+        // SG: Each top-dim cell (cube in 3D) has twelve 1-dim cells (edges). And so, we need to check which of these 12 edges are introduced by (ix, iy, iz). Furthermore, for each edge, we need to compare against three other neighbours which share this edge with us.
         change -= (ccc < ctf&& ccc < ccf&& ccc < ctc);       // top front edge
         change -= (ccc < ltc&& ccc < ctc&& ccc < lcc);       // top left edge
         change -= (ccc < ctc&& ccc <= ctb && ccc <= ccb);    // top back edge
@@ -351,6 +359,7 @@ __global__ void ECC_kernel_3D(
         change -= (ccc < ccf&& ccc < rcf&& ccc <= rcc);      // front right edge
 
         // Introduced faces F (6)
+        // SG: Each top-dim cell (cube in 3D) has six 2-dim cells (square/face). And so, we need to check which of these 6 faces are introduced by (ix, iy, iz). Furthermore, for each face, we need to compare against only one other neighbour which shares this face with us.
         change += (ccc < ccf);   // front face
         change += (ccc < lcc);   // left face
         change += (ccc <= ccb);  // back face
@@ -358,9 +367,10 @@ __global__ void ECC_kernel_3D(
         change += (ccc < ctc);   // top face
         change += (ccc <= cdc);  // down face
 
+        // SG: updating the local VCEC; atomicAdd to prevent race conditions
         atomicAdd(&hist_local_[binary_search(&hist_local_[binNum], binNum, ccc)], change);
     }
-    __syncthreads();
+    __syncthreads(); // SG: wait for all threads to update local VCEC; then update global VCEC
     if (blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x < binNum)
         atomicAdd(&VCEC_device[blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x], (int)hist_local_[blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x]);
 }
