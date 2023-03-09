@@ -290,7 +290,7 @@ __global__ void ECC_kernel_3D(
 {
     // Declare and initialize local histogram
     extern __shared__ float hist_local_[];
-    int block_pos = blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x;  // SG: Doubt: should it be blockDim.z instead of blockDim.x ? Otherwise, similar logic to the 2D case. Each thread initializes multiple locations to 0 (each location is blockDim.x*blockDim.y*blockDim.z apart) in the hist_local_
+    int block_pos = blockDim.x * blockDim.y * threadIdx.z + blockDim.x * threadIdx.y + threadIdx.x;  // SG: Doubt: should it be blockDim.z instead of blockDim.x ? Nope! Compare with 2D code and you'll see why. Otherwise, similar logic to the 2D case. Each thread initializes multiple locations to 0 (each location is blockDim.x*blockDim.y*blockDim.z apart) in the hist_local_
     while (block_pos < binNum) {
         hist_local_[block_pos] = 0;
         hist_local_[block_pos + binNum] = ascend_unique_arr_device_[block_pos];
